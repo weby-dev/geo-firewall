@@ -40,6 +40,18 @@ struct Config {
     // Empty => token check skipped (NOT recommended).
     std::string ua_token     = "";
 
+    // --- Custom User-Agent allowlist mode -----------------------------------
+    // When EITHER of these is set, the firewall switches to ALLOWLIST mode on
+    // web ports: ONLY requests whose User-Agent matches one of your custom
+    // entries are allowed, and the mobile/bot/required-header heuristics are
+    // bypassed. Use this for "only my own custom clients may connect".
+    //   - allowed_ua_file: a file with one custom User-Agent per line; a request
+    //     is allowed if its UA CONTAINS any line (case-sensitive substring).
+    //   - allowed_ua_regex: an inline case-sensitive regex alternative.
+    // Geo (home_country) and datacenter-ASN gates still apply.
+    std::string allowed_ua_file  = "";
+    std::string allowed_ua_regex = "";
+
     // Stop accumulating / reading request headers after this many bytes. A
     // request whose headers exceed this without a verdict is rejected (anti
     // slow-loris / oversized-header abuse).

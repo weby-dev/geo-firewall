@@ -48,6 +48,28 @@ Policy::Policy(const Config& c) : cfg_(c) {
     }
     required_headers_ = split_csv_lower(cfg_.required_headers);
 
+    // Custom UA allowlist (case-sensitive). Either an inline regex or a file
+    // with one UA substring per line activates allowlist mode.
+    if (!cfg_.allowed_ua_regex.empty()) {
+        allow_re_ = std::regex(cfg_.allowed_ua_regex, std::regex::optimize);
+        have_allow_regex_ = true;
+    }
+    if (!cfg_.allowed_ua_file.empty()) {
+        std::ifstream in(cfg_.allowed_ua_file);
+        if (!in) {
+            std::cerr << "policy: WARNING cannot read allowed_ua_file '"
+                      << cfg_.allowed_ua_file << "' -- ignoring\n";
+        } else {
+            std::string line;
+            while (std::getline(in, line)) {
+                std::string t = trim(line);
+                if (t.empty() || t[0] == '#') continue;  // blank / comment line
+                allowed_uas_.push_back(t);
+            }
+        }
+    }
+    have_allow_ = have_allow_regex_ || !allowed_uas_.empty();
+
     if (!cfg_.blocked_asn_file.empty()) {
         std::ifstream in(cfg_.blocked_asn_file);
         if (!in) {
@@ -70,6 +92,13 @@ Policy::Policy(const Config& c) : cfg_(c) {
 bool Policy::is_blocked_asn(uint32_t asn, const std::string& org) const {
     if (asn != 0 && blocked_asns_.count(asn)) return true;
     if (have_dc_ && !org.empty() && std::regex_search(org, dc_)) return true;
+    return false;
+}
+
+bool Policy::ua_allowlisted(const std::string& ua) const {
+    if (have_allow_regex_ && std::regex_search(ua, allow_re_)) return true;
+    for (const auto& entry : allowed_uas_)
+        if (ua.find(entry) != std::string::npos) return true;
     return false;
 }
 
@@ -119,6 +148,15 @@ HttpVerdict Policy::evaluate_http(const std::string& buf, std::string& out_ua,
         pos = eol + 2;
     }
     out_ua = ua;
+
+    // Allowlist mode: ONLY your custom User-Agents pass; mobile/bot/header
+    // heuristics are bypassed. (Geo + ASN gates still apply, upstream.)
+    if (have_allow_) {
+        if (ua.empty()) { reason = DenyReason::NoUa; return HttpVerdict::Deny; }
+        if (ua_allowlisted(ua)) return HttpVerdict::Allow;
+        reason = DenyReason::NotAllowlisted;
+        return HttpVerdict::Deny;
+    }
 
     // 4) Required browser headers.
     for (const auto& h : required_headers_) {

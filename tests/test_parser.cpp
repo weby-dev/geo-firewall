@@ -181,6 +181,29 @@ static void test_token() {
     CHECK(r == DenyReason::NoToken);
 }
 
+static void test_ua_allowlist() {
+    // Allowlist mode via inline regex: only the two custom UAs pass; mobile/bot
+    // heuristics and required headers are bypassed.
+    Config c;
+    c.allowed_ua_regex = "(MyApp/[0-9.]+|SecretAgent-X)";
+    Policy pol(c);
+    std::string ua; DenyReason r;
+
+    // matches -> allowed even though it's not "mobile" and sends no headers
+    CHECK(pol.evaluate_http("GET / HTTP/1.1\r\nUser-Agent: MyApp/2.5 (any device)\r\n\r\n", ua, r)
+          == HttpVerdict::Allow);
+    CHECK(pol.evaluate_http("GET / HTTP/1.1\r\nUser-Agent: SecretAgent-X\r\n\r\n", ua, r)
+          == HttpVerdict::Allow);
+
+    // a normal mobile browser is NOT on the allowlist -> blocked
+    CHECK(pol.evaluate_http(req("Mozilla/5.0 (iPhone) Mobile"), ua, r) == HttpVerdict::Deny);
+    CHECK(r == DenyReason::NotAllowlisted);
+
+    // no UA -> NoUa
+    CHECK(pol.evaluate_http("GET / HTTP/1.1\r\nHost: x\r\n\r\n", ua, r) == HttpVerdict::Deny);
+    CHECK(r == DenyReason::NoUa);
+}
+
 static void test_asn() {
     Config c;
     Policy pol(c);                     // default datacenter regex, block_datacenter=true
@@ -210,6 +233,7 @@ int main() {
     test_packet();
     test_policy();
     test_token();
+    test_ua_allowlist();
     test_asn();
     test_config_inline_comments();
     if (g_fail == 0) std::cout << "all tests passed\n";

@@ -63,6 +63,8 @@ Config Config::load(const std::string& path) {
             else if (key == "require_mobile")        c.require_mobile = to_bool(val);
             else if (key == "mobile_regex")          c.mobile_regex = val;
             else if (key == "ua_token")              c.ua_token = val;
+            else if (key == "allowed_ua_file")       c.allowed_ua_file = val;
+            else if (key == "allowed_ua_regex")      c.allowed_ua_regex = val;
             else if (key == "max_inspect_bytes")     c.max_inspect_bytes = (size_t)std::stoul(val);
             else if (key == "http_idle_timeout_s")   c.http_idle_timeout_s = std::stoi(val);
             else if (key == "max_http_conns")        c.max_http_conns = (size_t)std::stoul(val);

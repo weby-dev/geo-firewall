@@ -281,6 +281,7 @@ int queue_cb(const struct nlmsghdr* nlh, void* data) {
             case DenyReason::NotMobile:      g_stats.bump(g_stats.drop_ua);      why = "not-mobile"; break;
             case DenyReason::NoUa:           g_stats.bump(g_stats.drop_ua);      why = "no-ua"; break;
             case DenyReason::NoToken:        g_stats.bump(g_stats.drop_ua);      why = "no-token"; break;
+            case DenyReason::NotAllowlisted: g_stats.bump(g_stats.drop_ua);      why = "not-allowlisted"; break;
             case DenyReason::TooLarge:       g_stats.bump(g_stats.drop_nothttp); why = "headers-too-large"; break;
             case DenyReason::NotHttp:        g_stats.bump(g_stats.drop_nothttp); why = "not-http"; break;
             default:                         g_stats.bump(g_stats.drop_nothttp); break;
