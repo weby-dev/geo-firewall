@@ -51,6 +51,11 @@ WEB_BURST=300
 BAN_TTL="30m"
 # =============================================================================
 
+# install.sh writes machine-specific overrides here; the values above are just
+# fallback defaults. Sourcing keeps config out of the script body so you can
+# tweak admin IPs / queues / rate limits without editing this file.
+[[ -r /etc/webup-firewall/nftables.env ]] && . /etc/webup-firewall/nftables.env
+
 if [[ $EUID -ne 0 ]]; then echo "must run as root" >&2; exit 1; fi
 command -v nft >/dev/null || { echo "nftables (nft) not installed" >&2; exit 1; }
 

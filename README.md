@@ -98,6 +98,38 @@ NFQUEUE daemon; the encrypted HTTPS checks are mirrored in nginx.
 
 ---
 
+## Quick install (recommended)
+
+`install.sh` detects your package manager (apt / dnf / yum / pacman / zypper),
+installs deps, builds, configures, and starts the service. Run it from the repo
+root on the **Linux server**:
+
+```bash
+git clone https://github.com/weby-dev/geo-firewall.git
+cd geo-firewall
+sudo ./install.sh
+```
+
+It prompts for everything (admin SSH IP — auto-detected from your session, home
+country, queues, optional secret token, MaxMind Account ID + License Key) with
+sensible defaults. Settings land in `/etc/webup-firewall/firewall.conf` and
+`/etc/webup-firewall/nftables.env`.
+
+Fully unattended (e.g. for config management):
+
+```bash
+sudo WEBUP_ADMIN_IPS="1.2.3.4" WEBUP_HOME_COUNTRY=IN WEBUP_NUM_QUEUES=4 \
+     WEBUP_MM_ACCOUNT=123456 WEBUP_MM_KEY=xxxxxxxx ./install.sh --yes
+```
+
+Flags: `--yes` (non-interactive; requires `WEBUP_ADMIN_IPS` so you can't lock
+yourself out), `--no-start` (install but don't activate the ruleset yet).
+
+The manual steps below remain valid if you'd rather do it by hand or understand
+each piece.
+
+---
+
 ## Build (on the Linux server)
 
 > The daemon is Linux-only (netfilter). Build on the server, or cross-compile.
