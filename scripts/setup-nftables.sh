@@ -130,5 +130,10 @@ EOF
 
 echo "webup nftables ruleset installed: queues ${QUEUE_BASE}-${LAST_QUEUE}."
 echo "Admin SSH allowlist v4: ${ADMIN_IPS_V4[*]:-<none>}  v6: ${ADMIN_IPS_V6[*]:-<none>}"
-[[ ${#ADMIN_IPS_V4[@]} -eq 0 && ${#ADMIN_IPS_V6[@]} -eq 0 ]] && \
+if [[ ${#ADMIN_IPS_V4[@]} -eq 0 && ${#ADMIN_IPS_V6[@]} -eq 0 ]]; then
     echo "WARNING: no admin IPs set -- if the daemon dies you may be locked out!"
+fi
+
+# Explicit success: never let the exit status be poisoned by a preceding test
+# (e.g. the admin-IP check above) -- systemd treats any non-zero as a failure.
+exit 0
