@@ -1,7 +1,7 @@
 // Portable unit tests for the packet parser and the User-Agent policy.
 // No netfilter/GeoIP deps -> runs on any platform (CI, dev laptop, server).
 //
-//   c++ -std=c++17 -I src tests/test_parser.cpp src/packet.cpp \
+//   c++ -std=c++17 -I src tests/test_parser.cpp src/packet.cpp
 //       src/policy.cpp src/config.cpp -o webup-tests && ./webup-tests
 
 #include "packet.hpp"

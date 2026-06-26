@@ -22,6 +22,15 @@
 //
 // Build deps: libnetfilter_queue, libmnl, libmaxminddb (+ optional libsystemd).
 
+// glibc networking headers MUST come BEFORE the <linux/*> UAPI headers below.
+// <linux/netfilter.h> pulls in <linux/in.h>; if glibc's <netinet/in.h> is not
+// already included, both define struct in_addr / IPPROTO_* and the build fails
+// with "redefinition of struct in_addr". Including the glibc header first lets
+// <linux/libc-compat.h> suppress the kernel's duplicate definitions.
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+
 #include <libmnl/libmnl.h>
 #include <linux/netfilter.h>
 #include <linux/netfilter/nfnetlink.h>
@@ -29,8 +38,6 @@
 #include <linux/netfilter/nfnetlink_conntrack.h>
 #include <libnetfilter_queue/libnetfilter_queue.h>
 
-#include <sys/socket.h>
-#include <arpa/inet.h>
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
