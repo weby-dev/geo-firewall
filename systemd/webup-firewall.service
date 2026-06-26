@@ -1,0 +1,58 @@
+[Unit]
+Description=WebUp C++ geo/direction/User-Agent firewall daemon
+Documentation=file:/opt/webup-firewall/README.md
+After=network-pre.target nftables.service
+Wants=network-pre.target
+# If the daemon stops for good, don't leave a half-open ruleset around.
+StopWhenUnneeded=false
+
+[Service]
+Type=notify
+NotifyAccess=main
+WatchdogSec=30
+# Install the nft ruleset before start, tear it down after stop. The '+' prefix
+# runs these as root even though the daemon itself runs unprivileged.
+ExecStartPre=+/opt/webup-firewall/scripts/setup-nftables.sh
+ExecStart=/usr/local/sbin/webup-firewall /etc/webup-firewall/firewall.conf
+ExecReload=/bin/kill -HUP $MAINPID
+ExecStopPost=+/opt/webup-firewall/scripts/teardown-nftables.sh
+
+# Fail-closed restart loop. nftables policy DROP keeps new inbound blocked while
+# the daemon is down; admin SSH stays open via the allowlist.
+Restart=always
+RestartSec=2
+
+# --- privilege & sandbox ---------------------------------------------------
+# Runs as a dedicated unprivileged user with only CAP_NET_ADMIN (needed to talk
+# to NFQUEUE / set conntrack marks). Create it once:
+#   useradd --system --no-create-home --shell /usr/sbin/nologin webup-fw
+User=webup-fw
+Group=webup-fw
+AmbientCapabilities=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN
+NoNewPrivileges=true
+
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+# The daemon only needs netlink (NFQUEUE) and unix (sd_notify) sockets.
+RestrictAddressFamilies=AF_NETLINK AF_UNIX
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallArchitectures=native
+# Config + GeoIP DB are read-only to the daemon.
+ReadOnlyPaths=/etc/webup-firewall /usr/share/GeoIP
+
+[Install]
+WantedBy=multi-user.target
