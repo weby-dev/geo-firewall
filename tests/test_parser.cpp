@@ -12,6 +12,8 @@
 #include <netinet/in.h>
 #include <cstdint>
 #include <cstring>
+#include <cstdio>
+#include <fstream>
 #include <string>
 #include <vector>
 #include <iostream>
@@ -189,11 +191,27 @@ static void test_asn() {
     CHECK(!pol.is_blocked_asn(24560, "Bharti Airtel Ltd."));
 }
 
+static void test_config_inline_comments() {
+    const char* path = "/tmp/webup_test_cfg.conf";
+    { std::ofstream f(path);
+      f << "home_country = IN   # inside country (ISO alpha-2)\n";
+      f << "num_queues   = 8    # one per core\n";
+      f << "bot_ua_regex = (bot|crawl#weird)\n";   // '#' not after space -> kept
+      f << "ua_token     =\n"; }
+    Config c = Config::load(path);
+    CHECK(c.home_country == "IN");                  // inline comment stripped
+    CHECK(c.num_queues == 8);
+    CHECK(c.bot_ua_regex == "(bot|crawl#weird)");   // embedded '#' preserved
+    CHECK(c.ua_token.empty());
+    std::remove(path);
+}
+
 int main() {
     test_packet();
     test_policy();
     test_token();
     test_asn();
+    test_config_inline_comments();
     if (g_fail == 0) std::cout << "all tests passed\n";
     else             std::cout << g_fail << " test(s) FAILED\n";
     return g_fail ? 1 : 0;

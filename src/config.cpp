@@ -38,7 +38,17 @@ Config Config::load(const std::string& path) {
             continue;
         }
         std::string key = trim(s.substr(0, eq));
-        std::string val = trim(s.substr(eq + 1));
+        std::string val = s.substr(eq + 1);
+        // Strip an inline comment: a '#' at the start of the value, or one
+        // preceded by whitespace, begins a comment. (A '#' embedded in a token,
+        // e.g. a regex, is kept.) This lets "key = value   # note" work.
+        for (size_t i = 0; i < val.size(); ++i) {
+            if (val[i] == '#' && (i == 0 || val[i-1] == ' ' || val[i-1] == '\t')) {
+                val.erase(i);
+                break;
+            }
+        }
+        val = trim(val);
 
         try {
             if      (key == "base_queue")            c.base_queue = (uint16_t)std::stoul(val);
