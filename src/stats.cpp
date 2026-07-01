@@ -1,25 +1,29 @@
 #include "stats.hpp"
 #include <sstream>
 
-std::string Stats::format() const {
-    auto l = [](const std::atomic<uint64_t>& c) {
-        return c.load(std::memory_order_relaxed);
+std::string Stats::format(const std::vector<Stats>& all) {
+    // Sum one field across all workers.
+    auto sum = [&all](std::atomic<uint64_t> Stats::* field) {
+        uint64_t t = 0;
+        for (const auto& s : all)
+            t += (s.*field).load(std::memory_order_relaxed);
+        return t;
     };
     std::ostringstream os;
     os << "stats"
-       << " pkts="          << l(pkts)
-       << " accept_normal=" << l(accept_normal)
-       << " accept_https="  << l(accept_https)
-       << " accept_http="   << l(accept_http)
-       << " drop_geo="      << l(drop_geo)
-       << " drop_asn="      << l(drop_asn)
-       << " drop_ua="       << l(drop_ua)
-       << " drop_botua="    << l(drop_botua)
-       << " drop_headers="  << l(drop_headers)
-       << " drop_nothttp="  << l(drop_nothttp)
-       << " drop_parse="    << l(drop_parse)
-       << " needmore="      << l(needmore)
-       << " conns_shed="    << l(conns_shed)
-       << " enobufs="       << l(enobufs);
+       << " pkts="          << sum(&Stats::pkts)
+       << " accept_normal=" << sum(&Stats::accept_normal)
+       << " accept_https="  << sum(&Stats::accept_https)
+       << " accept_http="   << sum(&Stats::accept_http)
+       << " drop_geo="      << sum(&Stats::drop_geo)
+       << " drop_asn="      << sum(&Stats::drop_asn)
+       << " drop_ua="       << sum(&Stats::drop_ua)
+       << " drop_botua="    << sum(&Stats::drop_botua)
+       << " drop_headers="  << sum(&Stats::drop_headers)
+       << " drop_nothttp="  << sum(&Stats::drop_nothttp)
+       << " drop_parse="    << sum(&Stats::drop_parse)
+       << " needmore="      << sum(&Stats::needmore)
+       << " conns_shed="    << sum(&Stats::conns_shed)
+       << " enobufs="       << sum(&Stats::enobufs);
     return os.str();
 }

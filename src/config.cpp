@@ -55,6 +55,8 @@ Config Config::load(const std::string& path) {
             else if (key == "num_queues")            c.num_queues = (unsigned)std::stoul(val);
             else if (key == "mark_approved")         c.mark_approved = (uint32_t)std::stoul(val);
             else if (key == "mark_rejected")         c.mark_rejected = (uint32_t)std::stoul(val);
+            else if (key == "queue_maxlen")          c.queue_maxlen = (uint32_t)std::stoul(val);
+            else if (key == "recv_buffer_bytes")     c.recv_buffer_bytes = (uint32_t)std::stoul(val);
             else if (key == "geoip_db")              c.geoip_db = val;
             else if (key == "home_country")          c.home_country = val;
             else if (key == "treat_unknown_as_home") c.treat_unknown_as_home = to_bool(val);
@@ -107,4 +109,8 @@ void Config::validate() const {
         throw std::runtime_error("max_inspect_bytes out of range (64..1048576)");
     if (max_http_conns < 1)
         throw std::runtime_error("max_http_conns must be >= 1");
+    if (queue_maxlen < 1)
+        throw std::runtime_error("queue_maxlen must be >= 1");
+    if (recv_buffer_bytes < 65536)
+        throw std::runtime_error("recv_buffer_bytes must be >= 65536");
 }

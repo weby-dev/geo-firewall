@@ -5,12 +5,6 @@
 
 namespace {
 
-std::string ip_to_text(int af, const void* addr) {
-    char b[INET6_ADDRSTRLEN] = {0};
-    inet_ntop(af, addr, b, sizeof(b));
-    return std::string(b);
-}
-
 // Alignment-safe big-endian 16-bit read (packet buffers aren't word-aligned).
 uint16_t rd16(const uint8_t* p) {
     uint16_t v;
@@ -64,8 +58,8 @@ PktInfo parse_packet(const uint8_t* p, size_t len) {
         if (ihl < 20 || len < ihl) return pi;
         uint8_t proto = p[9];
         pi.af = AF_INET;
-        pi.src_ip = ip_to_text(AF_INET, p + 12);
-        pi.dst_ip = ip_to_text(AF_INET, p + 16);
+        std::memcpy(pi.src_addr, p + 12, 4);
+        std::memcpy(pi.dst_addr, p + 16, 4);
         // Fragment? MF bit or non-zero offset => only the first fragment has L4.
         uint16_t frag = rd16(p + 6);
         bool first_frag = (frag & 0x1fff) == 0;
@@ -80,8 +74,8 @@ PktInfo parse_packet(const uint8_t* p, size_t len) {
     if (version == 6) {
         if (len < 40) return pi;
         pi.af = AF_INET6;
-        pi.src_ip = ip_to_text(AF_INET6, p + 8);
-        pi.dst_ip = ip_to_text(AF_INET6, p + 24);
+        std::memcpy(pi.src_addr, p + 8, 16);
+        std::memcpy(pi.dst_addr, p + 24, 16);
 
         uint8_t nh = p[6];
         size_t off = 40;
@@ -114,3 +108,15 @@ PktInfo parse_packet(const uint8_t* p, size_t len) {
 
     return pi; // unknown L3
 }
+
+namespace {
+std::string addr_to_text(int af, const uint8_t* addr) {
+    if (af == 0) return "";
+    char b[INET6_ADDRSTRLEN] = {0};
+    inet_ntop(af, addr, b, sizeof(b));
+    return std::string(b);
+}
+} // namespace
+
+std::string PktInfo::src_text() const { return addr_to_text(af, src_addr); }
+std::string PktInfo::dst_text() const { return addr_to_text(af, dst_addr); }

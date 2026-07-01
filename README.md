@@ -70,9 +70,11 @@ NFQUEUE daemon; the encrypted HTTPS checks are mirrored in nginx.
 |---------|------------------|
 | Bot mitigation | Layered: datacenter/cloud/VPN **ASN block**, mobile-UA + required-header + bot-UA checks, in-kernel **rate-limit/auto-ban**. In-app browsers (TG/IG/FB) explicitly allowed. |
 | Throughput / resilience | **N worker threads, one per NFQUEUE**, flows fanned out by hash. A stall on one flow can't block others. Set `num_queues ≈ nproc`. |
+| Per-packet hot path | **No shared locks, no per-packet allocation.** GeoIP/ASN are looked up straight from the raw address bytes via `MMDB_lookup_sockaddr` (no `getaddrinfo` per packet); hot-swappable state is snapshotted once per batch (no `atomic<shared_ptr>` lock per packet); stats are **per-worker, cache-line aligned** (no cross-core counter bouncing); IP→text is computed only when actually logged. Built with LTO + `-O3`. |
+| Burst headroom | `queue_maxlen` (kernel packets buffered per queue, default 8192 vs the kernel's 1024) and `recv_buffer_bytes` (netlink socket buffer) absorb spikes before fail-closed drops; `NFQNL_COPY_PACKET` copies only the bytes actually inspected. |
 | GeoIP DB updates | **`SIGHUP` hot-reload** of DB + config + policy with zero dropped flows (`systemctl reload`). A bad reload is rejected and the old state kept. |
 | DoS / memory | Per-worker cap on pending HTTP flows (`max_http_conns`) + idle sweep; excess is shed. Bounded header inspection (`max_inspect_bytes`). |
-| Observability | Atomic counters dumped every `stats_interval_s` and on `SIGUSR1`; per-rule `counter`s visible via `nft list table inet webup`. |
+| Observability | Per-worker atomic counters summed and dumped every `stats_interval_s` and on `SIGUSR1`; per-rule `counter`s visible via `nft list table inet webup`. |
 | Liveness | Optional **systemd watchdog** (`Type=notify`, `WatchdogSec=30`) + `Restart=always`. |
 | Fail mode | **Fail-closed** (policy DROP) with an admin-SSH allowlist so you can always recover. |
 | Privilege | Runs as a **dedicated unprivileged user** with only `CAP_NET_ADMIN`, plus a strict systemd sandbox. |
@@ -123,7 +125,27 @@ sudo WEBUP_ADMIN_IPS="1.2.3.4" WEBUP_HOME_COUNTRY=IN WEBUP_NUM_QUEUES=4 \
 ```
 
 Flags: `--yes` (non-interactive; requires `WEBUP_ADMIN_IPS` so you can't lock
-yourself out), `--no-start` (install but don't activate the ruleset yet).
+yourself out), `--no-start` (install but don't activate the ruleset yet),
+`--reconfigure` (re-run the questions on an already-configured host).
+
+### Updating
+
+Re-running the installer on a host that's already configured **updates in
+place** — it rebuilds and reinstalls the daemon, scripts and service unit, then
+restarts, **without touching your existing `firewall.conf`, `nftables.env` or
+MaxMind credentials** (and it refreshes the GeoIP databases if creds are
+stored). So upgrading to a newer version is just:
+
+```bash
+git clone https://github.com/weby-dev/geo-firewall.git
+cd geo-firewall
+sudo ./install.sh          # detects the existing install → update, keeps settings
+```
+
+The binary is swapped atomically (temp + rename), so the update is safe while
+the old daemon is still serving traffic. Pass `--reconfigure` if you want to
+change settings instead of keeping them (current values are offered as
+defaults).
 
 The manual steps below remain valid if you'd rather do it by hand or understand
 each piece.
@@ -172,7 +194,9 @@ package to keep both fresh, then reload after each update (see "Operations").
 1. **`config/firewall.conf`** — confirm `home_country = IN`, the two GeoIP paths,
    and `num_queues` (≈ CPU count). Leave `ua_token` **empty** for open mobile
    access (no challenge); set it only for app-only mode. Tune
-   `datacenter_org_regex` / `bot_ua_regex` / `inapp_allow_regex` if needed.
+   `datacenter_org_regex` / `bot_ua_regex` / `inapp_allow_regex` if needed. For
+   high traffic, set `num_queues ≈ nproc` and raise `queue_maxlen` /
+   `recv_buffer_bytes` for more burst headroom before fail-closed drops.
 2. **`scripts/setup-nftables.sh`** — set `ADMIN_IPS_V4` to your admin IP(s), and
    make `QUEUE_BASE` / `NUM_QUEUES` match the config. **Set admin IPs or you risk
    locking yourself out.**

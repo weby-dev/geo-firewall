@@ -90,7 +90,7 @@ static void test_packet() {
         CHECK(pi.ok);
         CHECK(pi.af == AF_INET);
         CHECK(pi.is_tcp);
-        CHECK(pi.src_ip == "8.8.8.8");
+        CHECK(pi.src_text() == "8.8.8.8");
         CHECK(pi.src_port == 4444);
         CHECK(pi.dst_port == 80);
         CHECK(pi.l4_payload_len == 16);
@@ -115,7 +115,7 @@ static void test_packet() {
         auto pkt = ipv6_tcp("2001:db8::5", 443, /*with_ext=*/false);
         PktInfo pi = parse_packet(pkt.data(), pkt.size());
         CHECK(pi.ok && pi.af == AF_INET6 && pi.is_tcp && pi.dst_port == 443);
-        CHECK(pi.src_ip == "2001:db8::5");
+        CHECK(pi.src_text() == "2001:db8::5");
     }
     {   // IPv6 with a hop-by-hop ext header before TCP
         auto pkt = ipv6_tcp("2001:db8::5", 80, /*with_ext=*/true);

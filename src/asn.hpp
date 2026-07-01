@@ -13,8 +13,10 @@ public:
     ASNDB(const ASNDB&) = delete;
     ASNDB& operator=(const ASNDB&) = delete;
 
-    // Returns true and fills asn/org if the address is found.
-    bool lookup(const std::string& ip_text, uint32_t& asn, std::string& org) const;
+    // Returns true and fills asn/org if the address is found. Takes the raw
+    // address bytes (af = AF_INET/AF_INET6) and looks up via
+    // MMDB_lookup_sockaddr() -- no getaddrinfo() on the per-packet hot path.
+    bool lookup(int af, const void* addr, uint32_t& asn, std::string& org) const;
 
 private:
     mutable MMDB_s mmdb_{};

@@ -19,7 +19,18 @@
 # Flags:
 #   -y, --yes         non-interactive; use env vars / defaults, never prompt
 #       --no-start    install + enable but do NOT start (review before going live)
+#       --reconfigure re-run the questions and regenerate config, even if already
+#                     installed (default on re-run: keep existing settings, just
+#                     rebuild the binary + refresh GeoIP + restart)
 #   -h, --help        show this help
+#
+# Re-running on an already-configured host UPDATES in place: it rebuilds and
+# reinstalls the daemon/scripts/service and restarts, WITHOUT touching your
+# existing firewall.conf / nftables.env / GeoIP credentials. So the documented
+# upgrade flow just works:
+#
+#   git clone https://github.com/weby-dev/geo-firewall.git
+#   cd geo-firewall && sudo ./install.sh
 
 set -euo pipefail
 
@@ -27,7 +38,7 @@ log()  { printf '\033[1;32m[*]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[!]\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31m[x]\033[0m %s\n' "$*" >&2; exit 1; }
 
-usage() { sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 0; }
+usage() { sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'; exit 0; }
 
 [[ "$(id -u)" -eq 0 ]] || die "run as root:  sudo ./install.sh"
 [[ "$(uname -s)" == "Linux" ]] || die "Linux only -- the daemon needs netfilter/NFQUEUE."
@@ -39,14 +50,42 @@ cd "$REPO_DIR"
 # ---------------------------------------------------------------- flags --------
 ASSUME_YES=0
 DO_START=1
+RECONFIGURE=0
 for arg in "$@"; do
     case "$arg" in
         -y|--yes|--non-interactive) ASSUME_YES=1 ;;
         --no-start) DO_START=0 ;;
+        --reconfigure|--reconfig) RECONFIGURE=1 ;;
         -h|--help) usage ;;
         *) die "unknown argument: $arg (try --help)" ;;
     esac
 done
+
+# ------------------------------------------------------- install vs update -----
+# An existing firewall.conf means this host is already configured. On a plain
+# re-run we then UPDATE in place: rebuild + reinstall + restart, but PRESERVE the
+# existing config/nftables.env/GeoIP creds. --reconfigure forces the full Q&A.
+CONF_DIR=/etc/webup-firewall
+CONF_FILE="$CONF_DIR/firewall.conf"
+NFT_ENV="$CONF_DIR/nftables.env"
+MODE=install
+PRESERVE=0
+if [[ -f "$CONF_FILE" ]]; then
+    MODE=update
+    [[ "$RECONFIGURE" -eq 1 ]] || PRESERVE=1
+fi
+
+# conf_get KEY FILE -> value of `KEY = value` (last match; trims surrounding ws)
+conf_get() {
+    [[ -r "$2" ]] || return 0
+    sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*//p" "$2" | tail -n1 \
+        | sed 's/[[:space:]]*$//'
+}
+# admin IPs currently in nftables.env (v4 + v6), space-separated
+read_existing_admin_ips() {
+    ( set +u; . "$NFT_ENV" 2>/dev/null
+      echo "${ADMIN_IPS_V4[*]:-} ${ADMIN_IPS_V6[*]:-}" ) | xargs 2>/dev/null || true
+}
 
 # ask VAR "prompt" "default" [silent]
 # Precedence: env WEBUP_<VAR>  >  interactive answer  >  default.
@@ -65,59 +104,80 @@ ask() {
 yesno_to_bool() { case "${1,,}" in y|yes|true|1|on) echo true ;; *) echo false ;; esac; }
 
 # ---------------------------------------------------- gather inputs ------------
-DEF_ADMIN="$(awk '{print $1}' <<<"${SSH_CONNECTION:-}")"
-[[ -z "$DEF_ADMIN" ]] && DEF_ADMIN="$(awk '{print $1}' <<<"${SSH_CLIENT:-}")"
-DEF_QUEUES="$(nproc 2>/dev/null || echo 4)"
+# Safe defaults so `set -u` never trips on these later, even in preserve mode
+# where the interactive Q&A is skipped entirely.
+ADMIN_IPS=""; HOME_COUNTRY=""; NUM_QUEUES=""; BLOCK_DC_BOOL=""
+UA_TOKEN=""; MM_ACCOUNT=""; MM_KEY=""; ALLOWED_UAS=""; ALLOWED_UA_FILE=""
+ADMIN_V4=(); ADMIN_V6=()
 
-echo "=== WebUp firewall installer ==="
-ask ADMIN_IPS  "Admin IP(s) allowed to SSH regardless of geo (space-separated)" "$DEF_ADMIN"
-ask HOME_COUNTRY "Home country -- allowed inbound (ISO 3166 alpha-2)" "IN"
-ask NUM_QUEUES "Worker threads / NFQUEUEs (≈ CPU count)" "$DEF_QUEUES"
-ask BLOCK_DC   "Block datacenter/cloud/VPN networks on web ports? (yes/no)" "yes"
+if [[ "$PRESERVE" -eq 1 ]]; then
+    log "Existing installation detected ($CONF_FILE)."
+    log "UPDATING in place: rebuild + reinstall + restart, keeping your current"
+    log "settings. Run with --reconfigure to change them."
+else
+    # Defaults: seed from the existing config when reconfiguring an install,
+    # else from the environment / sensible fallbacks on a fresh install.
+    DEF_ADMIN="$(awk '{print $1}' <<<"${SSH_CONNECTION:-}")"
+    [[ -z "$DEF_ADMIN" ]] && DEF_ADMIN="$(awk '{print $1}' <<<"${SSH_CLIENT:-}")"
+    DEF_HOME="IN"
+    DEF_QUEUES="$(nproc 2>/dev/null || echo 4)"
+    DEF_BLOCK="yes"
+    if [[ "$MODE" == update ]]; then
+        log "Reconfiguring existing install -- current values shown as defaults."
+        cur_admin="$(read_existing_admin_ips)";              [[ -n "$cur_admin" ]] && DEF_ADMIN="$cur_admin"
+        cur_home="$(conf_get home_country "$CONF_FILE")";    [[ -n "$cur_home" ]]  && DEF_HOME="$cur_home"
+        cur_q="$(conf_get num_queues "$CONF_FILE")";         [[ -n "$cur_q" ]]     && DEF_QUEUES="$cur_q"
+        [[ "$(conf_get block_datacenter "$CONF_FILE")" == false ]] && DEF_BLOCK="no"
+    fi
 
-# Custom User-Agent allowlist (allowlist mode). When you provide one or more
-# entries, ONLY requests whose User-Agent contains one of them are allowed on
-# web ports -- the mobile/bot heuristics are bypassed. Leave empty to instead
-# allow all mobile browsers.
-ALLOWED_UAS=""
-if [[ -n "${WEBUP_ALLOWED_UAS-}" ]]; then
-    ALLOWED_UAS="$WEBUP_ALLOWED_UAS"                 # newline-separated
-elif [[ "$ASSUME_YES" -eq 0 ]]; then
-    echo "Allowed custom User-Agents (one per line, blank line to finish)."
-    echo "  -> ONLY these will be accepted. Leave empty to allow all mobile browsers."
-    while true; do
-        read -r -p "  custom UA> " __ua || break
-        [[ -z "$__ua" ]] && break
-        ALLOWED_UAS+="${__ua}"$'\n'
+    echo "=== WebUp firewall installer ==="
+    ask ADMIN_IPS  "Admin IP(s) allowed to SSH regardless of geo (space-separated)" "$DEF_ADMIN"
+    ask HOME_COUNTRY "Home country -- allowed inbound (ISO 3166 alpha-2)" "$DEF_HOME"
+    ask NUM_QUEUES "Worker threads / NFQUEUEs (≈ CPU count)" "$DEF_QUEUES"
+    ask BLOCK_DC   "Block datacenter/cloud/VPN networks on web ports? (yes/no)" "$DEF_BLOCK"
+
+    # Custom User-Agent allowlist (allowlist mode). When you provide one or more
+    # entries, ONLY requests whose User-Agent contains one of them are allowed on
+    # web ports -- the mobile/bot heuristics are bypassed. Leave empty to instead
+    # allow all mobile browsers.
+    if [[ -n "${WEBUP_ALLOWED_UAS-}" ]]; then
+        ALLOWED_UAS="$WEBUP_ALLOWED_UAS"                 # newline-separated
+    elif [[ "$ASSUME_YES" -eq 0 ]]; then
+        echo "Allowed custom User-Agents (one per line, blank line to finish)."
+        echo "  -> ONLY these will be accepted. Leave empty to allow all mobile browsers."
+        while true; do
+            read -r -p "  custom UA> " __ua || break
+            [[ -z "$__ua" ]] && break
+            ALLOWED_UAS+="${__ua}"$'\n'
+        done
+    fi
+
+    # Secret token only applies in open-mobile mode (ignored when an allowlist is set).
+    if [[ -z "$ALLOWED_UAS" ]]; then
+        ask UA_TOKEN "Secret User-Agent token (blank = open to all mobile browsers)" "" silent
+    else
+        UA_TOKEN=""
+    fi
+
+    # MaxMind License Key is shown as you type/paste it (plain text, not masked).
+    ask MM_ACCOUNT "MaxMind Account ID (blank to skip GeoIP auto-download)" ""
+    ask MM_KEY     "MaxMind License Key (shown as you type)" ""
+
+    if [[ -z "$ADMIN_IPS" ]]; then
+        if [[ "$ASSUME_YES" -eq 1 ]]; then
+            die "No admin IP. Set WEBUP_ADMIN_IPS to avoid locking yourself out (fail-closed firewall)."
+        fi
+        warn "No admin IP set -- if the daemon ever stops you may lose SSH. Continuing anyway."
+    fi
+    [[ "$HOME_COUNTRY" =~ ^[A-Za-z]{2}$ ]] || die "home country must be a 2-letter code (got '$HOME_COUNTRY')"
+    HOME_COUNTRY="${HOME_COUNTRY^^}"
+    BLOCK_DC_BOOL="$(yesno_to_bool "$BLOCK_DC")"
+
+    # Split admin IPs into v4 / v6 by presence of ':'.
+    for ip in $ADMIN_IPS; do
+        case "$ip" in *:*) ADMIN_V6+=("$ip") ;; *) ADMIN_V4+=("$ip") ;; esac
     done
 fi
-
-# Secret token only applies in open-mobile mode (ignored when an allowlist is set).
-if [[ -z "$ALLOWED_UAS" ]]; then
-    ask UA_TOKEN "Secret User-Agent token (blank = open to all mobile browsers)" "" silent
-else
-    UA_TOKEN=""
-fi
-
-# MaxMind License Key is shown as you type/paste it (plain text, not masked).
-ask MM_ACCOUNT "MaxMind Account ID (blank to skip GeoIP auto-download)" ""
-ask MM_KEY     "MaxMind License Key (shown as you type)" ""
-
-if [[ -z "$ADMIN_IPS" ]]; then
-    if [[ "$ASSUME_YES" -eq 1 ]]; then
-        die "No admin IP. Set WEBUP_ADMIN_IPS to avoid locking yourself out (fail-closed firewall)."
-    fi
-    warn "No admin IP set -- if the daemon ever stops you may lose SSH. Continuing anyway."
-fi
-[[ "$HOME_COUNTRY" =~ ^[A-Za-z]{2}$ ]] || die "home country must be a 2-letter code (got '$HOME_COUNTRY')"
-HOME_COUNTRY="${HOME_COUNTRY^^}"
-BLOCK_DC_BOOL="$(yesno_to_bool "$BLOCK_DC")"
-
-# Split admin IPs into v4 / v6 by presence of ':'.
-ADMIN_V4=(); ADMIN_V6=()
-for ip in $ADMIN_IPS; do
-    case "$ip" in *:*) ADMIN_V6+=("$ip") ;; *) ADMIN_V4+=("$ip") ;; esac
-done
 
 # ---------------------------------------------------- dependencies -------------
 install_deps() {
@@ -162,8 +222,16 @@ id webup-fw >/dev/null 2>&1 || \
 install -d /opt/webup-firewall /etc/webup-firewall /usr/local/sbin "$GEO_DIR"
 cp -r scripts /opt/webup-firewall/
 chmod +x /opt/webup-firewall/scripts/*.sh
-install -m 0755 build/webup-firewall /usr/local/sbin/webup-firewall
+# Atomic replace via same-dir rename so an UPDATE works even while the old
+# daemon is still running (writing the in-use binary in place can fail with
+# ETXTBSY; the running process keeps the old inode until the restart below).
+install -m 0755 build/webup-firewall /usr/local/sbin/webup-firewall.new
+mv -f /usr/local/sbin/webup-firewall.new /usr/local/sbin/webup-firewall
 install -m 0644 systemd/webup-firewall.service /etc/systemd/system/webup-firewall.service
+
+if [[ "$PRESERVE" -eq 1 ]]; then
+    log "Keeping existing config: $CONF_FILE, $NFT_ENV"
+else
 
 # back up an existing config before overwriting
 if [[ -f /etc/webup-firewall/firewall.conf ]]; then
@@ -171,7 +239,6 @@ if [[ -f /etc/webup-firewall/firewall.conf ]]; then
 fi
 
 # custom User-Agent allowlist file (one UA substring per line), if provided
-ALLOWED_UA_FILE=""
 if [[ -n "$ALLOWED_UAS" ]]; then
     ALLOWED_UA_FILE=/etc/webup-firewall/allowed_uas.txt
     printf '%s' "$ALLOWED_UAS" > "$ALLOWED_UA_FILE"
@@ -186,6 +253,8 @@ base_queue = 0
 num_queues = ${NUM_QUEUES}
 mark_approved = 1
 mark_rejected = 2
+queue_maxlen = 8192
+recv_buffer_bytes = 8388608
 geoip_db = ${GEO_DIR}/GeoLite2-Country.mmdb
 home_country = ${HOME_COUNTRY}
 treat_unknown_as_home = false
@@ -231,8 +300,21 @@ BAN_TTL="30m"
 EOF
 chmod 600 /etc/webup-firewall/nftables.env
 
+fi   # end: PRESERVE==0 config generation
+
 # ---------------------------------------------------- GeoIP --------------------
-if [[ -n "$MM_ACCOUNT" && -n "$MM_KEY" ]] && command -v geoipupdate >/dev/null; then
+if [[ "$PRESERVE" -eq 1 ]]; then
+    # Update mode: refresh existing databases if MaxMind creds are already stored.
+    if [[ -f /etc/GeoIP.conf ]] && command -v geoipupdate >/dev/null; then
+        log "Refreshing GeoIP databases (stored MaxMind credentials)..."
+        geoipupdate -v || warn "geoipupdate failed -- keeping existing databases."
+    elif [[ -f "${GEO_DIR}/GeoLite2-Country.mmdb" ]]; then
+        log "Keeping existing GeoIP databases (no stored MaxMind credentials)."
+    else
+        warn "No ${GEO_DIR}/GeoLite2-Country.mmdb and no stored creds -- daemon may not start."
+        DO_START=0
+    fi
+elif [[ -n "$MM_ACCOUNT" && -n "$MM_KEY" ]] && command -v geoipupdate >/dev/null; then
     log "Configuring + downloading GeoIP databases..."
     cat > /etc/GeoIP.conf <<EOF
 AccountID ${MM_ACCOUNT}
@@ -267,7 +349,7 @@ systemctl enable webup-firewall >/dev/null 2>&1 || true
 systemctl reset-failed webup-firewall 2>/dev/null || true
 
 if [[ "$DO_START" -eq 1 ]]; then
-    log "Starting webup-firewall..."
+    log "$([[ "$MODE" == update ]] && echo "Restarting" || echo "Starting") webup-firewall..."
     systemctl restart webup-firewall
     sleep 1
     systemctl --no-pager --full status webup-firewall | sed -n '1,12p' || true
@@ -275,10 +357,21 @@ else
     warn "Service enabled but NOT started. Start it with:  systemctl start webup-firewall"
 fi
 
+# In preserve mode the summary vars were never gathered -- read them back from
+# the on-disk config so the summary reflects the live settings.
+if [[ "$PRESERVE" -eq 1 ]]; then
+    HOME_COUNTRY="$(conf_get home_country "$CONF_FILE")"
+    NUM_QUEUES="$(conf_get num_queues "$CONF_FILE")"
+    [[ "$(conf_get block_datacenter "$CONF_FILE")" == false ]] && BLOCK_DC_BOOL=false || BLOCK_DC_BOOL=true
+    ADMIN_IPS="$(read_existing_admin_ips)"
+    ALLOWED_UA_FILE="$(conf_get allowed_ua_file "$CONF_FILE")"
+    UA_TOKEN="$(conf_get ua_token "$CONF_FILE")"
+fi
+
 cat <<EOF
 
 ==================================================================
- WebUp firewall installed.
+ WebUp firewall $([[ "$MODE" == update ]] && echo "updated" || echo "installed").
    home country : ${HOME_COUNTRY}     queues: ${NUM_QUEUES}     datacenter-block: ${BLOCK_DC_BOOL}
    admin SSH    : ${ADMIN_IPS:-<none>}
    access mode  : $([[ -n "$ALLOWED_UA_FILE" ]] && echo "custom UA allowlist ($ALLOWED_UA_FILE)" || { [[ -n "$UA_TOKEN" ]] && echo "app-only (token set)" || echo "open to all mobile browsers"; })

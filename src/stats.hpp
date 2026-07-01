@@ -2,10 +2,17 @@
 #include <atomic>
 #include <cstdint>
 #include <string>
+#include <vector>
 
-// Lock-free counters shared across all worker threads. Increments are relaxed
-// atomics (we only need eventual consistency for reporting).
-struct Stats {
+// Per-worker counters. Each worker thread owns ONE Stats instance and is its
+// only writer, so increments never contend across cores. The struct is
+// cache-line aligned (and padded to a multiple of the line size) so two
+// workers' counters can never share a cache line -- eliminating the false
+// sharing that a single global counter table would cause under high load.
+//
+// The main thread reads all workers' counters to print an aggregate snapshot;
+// the fields stay atomic (relaxed) so those cross-thread reads are well-defined.
+struct alignas(64) Stats {
     std::atomic<uint64_t> pkts{0};            // packets handed to userspace
     std::atomic<uint64_t> accept_normal{0};   // home, non-web port
     std::atomic<uint64_t> accept_https{0};    // home, 443 (nginx checks UA)
@@ -25,6 +32,6 @@ struct Stats {
         c.fetch_add(1, std::memory_order_relaxed);
     }
 
-    // One-line human-readable snapshot.
-    std::string format() const;
+    // One-line human-readable snapshot, summed across every worker's counters.
+    static std::string format(const std::vector<Stats>& all);
 };

@@ -1,5 +1,8 @@
 #include "asn.hpp"
 #include <stdexcept>
+#include <cstring>
+#include <sys/socket.h>
+#include <netinet/in.h>
 
 ASNDB::ASNDB(const std::string& db_path) {
     int status = MMDB_open(db_path.c_str(), MMDB_MODE_MMAP, &mmdb_);
@@ -13,12 +16,24 @@ ASNDB::~ASNDB() {
     if (open_) MMDB_close(&mmdb_);
 }
 
-bool ASNDB::lookup(const std::string& ip_text, uint32_t& asn,
+bool ASNDB::lookup(int af, const void* addr, uint32_t& asn,
                    std::string& org) const {
-    int gai_err = 0, mmdb_err = 0;
-    MMDB_lookup_result_s res =
-        MMDB_lookup_string(&mmdb_, ip_text.c_str(), &gai_err, &mmdb_err);
-    if (gai_err != 0 || mmdb_err != MMDB_SUCCESS || !res.found_entry)
+    struct sockaddr_storage ss{};
+    ss.ss_family = static_cast<sa_family_t>(af);
+    if (af == AF_INET) {
+        auto* s = reinterpret_cast<struct sockaddr_in*>(&ss);
+        std::memcpy(&s->sin_addr, addr, 4);
+    } else if (af == AF_INET6) {
+        auto* s = reinterpret_cast<struct sockaddr_in6*>(&ss);
+        std::memcpy(&s->sin6_addr, addr, 16);
+    } else {
+        return false;
+    }
+
+    int mmdb_err = 0;
+    MMDB_lookup_result_s res = MMDB_lookup_sockaddr(
+        &mmdb_, reinterpret_cast<const struct sockaddr*>(&ss), &mmdb_err);
+    if (mmdb_err != MMDB_SUCCESS || !res.found_entry)
         return false;
 
     asn = 0;

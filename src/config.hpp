@@ -18,6 +18,16 @@ struct Config {
     uint32_t mark_approved   = 1;
     uint32_t mark_rejected   = 2;
 
+    // Max packets the KERNEL will buffer per NFQUEUE before it starts dropping
+    // (fail-closed) while a worker briefly lags. The kernel default is only
+    // 1024, which a traffic burst overruns instantly; raise it so short spikes
+    // queue instead of getting dropped. Costs memory (~packet_size * this).
+    uint32_t queue_maxlen    = 8192;
+    // Netlink receive-socket buffer per worker (bytes). Bigger = more tolerant
+    // of bursts before ENOBUFS. Clamped by net.core.rmem_max unless the daemon
+    // has CAP_NET_ADMIN (it does), which lets it exceed that cap.
+    uint32_t recv_buffer_bytes = 8u * 1024 * 1024;
+
     // --- GeoIP ---
     std::string geoip_db     = "/usr/share/GeoIP/GeoLite2-Country.mmdb";
     std::string home_country = "IN";     // "inside" = this; everything else = "outside"

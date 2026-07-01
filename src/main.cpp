@@ -76,7 +76,6 @@ namespace {
 std::shared_ptr<const GeoIP>  g_geo;
 std::shared_ptr<const ASNDB>  g_asn;     // may be null (datacenter blocking off)
 std::shared_ptr<const Policy> g_policy;
-Stats                         g_stats;
 std::atomic<bool>             g_stop{false};
 
 // ---- per-connection state for half-decided HTTP/80 flows -------------------
@@ -90,11 +89,24 @@ struct Worker {
     struct mnl_socket* nl = nullptr;
     unsigned int       portid = 0;
     uint16_t           queue_num = 0;
+    Stats*             st = nullptr;      // this worker's private counters
     std::unordered_map<std::string, ConnState> http_conns;
 
     // rate-limited decision logging
     time_t  log_second = 0;
     int     log_count  = 0;
+};
+
+// Per-batch decision context handed to queue_cb. The GeoIP/ASN/Policy pointers
+// are snapshotted ONCE per received batch in worker_loop (which keeps the owning
+// shared_ptrs alive for the whole batch), so the per-packet callback never
+// touches the atomic shared_ptr slots -- avoiding the global lock those
+// std::atomic_load(shared_ptr) calls take on every access.
+struct CbCtx {
+    const GeoIP*  geo;
+    const ASNDB*  asn;     // may be null (datacenter blocking off)
+    const Policy* pol;
+    Worker*       w;
 };
 
 void verdict_put_ctmark(struct nlmsghdr* nlh, uint32_t mark) {
@@ -128,15 +140,15 @@ void log_decision(Worker& w, const Policy& pol, const PktInfo& pi,
                   const std::string& extra = "") {
     if (!should_log(w, pol)) return;
     std::cerr << "[q" << w.queue_num << "] " << action << "  "
-              << pi.src_ip << ":" << pi.src_port << " -> :" << pi.dst_port
+              << pi.src_text() << ":" << pi.src_port << " -> :" << pi.dst_port
               << "  geo=" << (country.empty() ? "??" : country);
     if (!extra.empty()) std::cerr << "  " << extra;
     std::cerr << "\n";
 }
 
 std::string conn_key(const PktInfo& pi) {
-    return pi.src_ip + "/" + std::to_string(pi.src_port) + ">" +
-           pi.dst_ip + "/" + std::to_string(pi.dst_port);
+    return pi.src_text() + "/" + std::to_string(pi.src_port) + ">" +
+           pi.dst_text() + "/" + std::to_string(pi.dst_port);
 }
 
 void sweep_http_conns(Worker& w, int idle_timeout_s) {
@@ -151,7 +163,12 @@ void sweep_http_conns(Worker& w, int idle_timeout_s) {
 
 // ---- per-packet decision ----------------------------------------------------
 int queue_cb(const struct nlmsghdr* nlh, void* data) {
-    Worker& w = *static_cast<Worker*>(data);
+    CbCtx& ctx = *static_cast<CbCtx*>(data);
+    Worker& w = *ctx.w;
+    Stats& st = *w.st;
+    const Policy* pol = ctx.pol;
+    const GeoIP*  geo = ctx.geo;
+    const Config& cfg = pol->cfg();
 
     struct nlattr* attr[NFQA_MAX + 1] = {};
     if (nfq_nlmsg_parse(nlh, attr) < 0) return MNL_CB_OK;
@@ -168,26 +185,22 @@ int queue_cb(const struct nlmsghdr* nlh, void* data) {
         payload_len = mnl_attr_get_payload_len(attr[NFQA_PAYLOAD]);
     }
 
-    auto geo = std::atomic_load(&g_geo);
-    auto pol = std::atomic_load(&g_policy);
-    const Config& cfg = pol->cfg();
-
-    g_stats.bump(g_stats.pkts);
+    st.bump(st.pkts);
 
     PktInfo pi = parse_packet(payload, payload_len);
-    if (!pi.ok || pi.src_ip.empty()) {           // can't parse -> fail closed
-        g_stats.bump(g_stats.drop_parse);
+    if (!pi.ok || pi.af == 0) {                  // can't parse -> fail closed
+        st.bump(st.drop_parse);
         send_verdict(w, id, NF_DROP, false, 0);
         return MNL_CB_OK;
     }
 
-    std::string country = geo->country(pi.src_ip);
+    std::string country = geo->country(pi.af, pi.src_addr);
     bool is_home = country.empty() ? cfg.treat_unknown_as_home
                                    : (country == cfg.home_country);
 
     // ---- Rule 1: anything not from the home country is dropped --------------
     if (!is_home) {
-        g_stats.bump(g_stats.drop_geo);
+        st.bump(st.drop_geo);
         log_decision(w, *pol, pi, country, "DROP-geo");
         send_verdict(w, id, NF_DROP, true, cfg.mark_rejected);
         return MNL_CB_OK;
@@ -198,7 +211,7 @@ int queue_cb(const struct nlmsghdr* nlh, void* data) {
 
     // ---- Home, non-web port -> normal --------------------------------------
     if (!is_http && !is_https) {
-        g_stats.bump(g_stats.accept_normal);
+        st.bump(st.accept_normal);
         log_decision(w, *pol, pi, country, "ACCEPT-normal");
         send_verdict(w, id, NF_ACCEPT, true, cfg.mark_approved);
         return MNL_CB_OK;
@@ -206,23 +219,21 @@ int queue_cb(const struct nlmsghdr* nlh, void* data) {
 
     // ---- Web port: block hosting/cloud/VPN networks (bots) ------------------
     // Real users are on mobile/residential ISPs; datacenter ASNs are bots.
-    if (cfg.block_datacenter) {
-        auto asn = std::atomic_load(&g_asn);
-        if (asn) {
-            uint32_t num = 0; std::string org;
-            if (asn->lookup(pi.src_ip, num, org) && pol->is_blocked_asn(num, org)) {
-                g_stats.bump(g_stats.drop_asn);
-                log_decision(w, *pol, pi, country, "DROP-asn",
-                             "AS" + std::to_string(num) + " \"" + org + "\"");
-                send_verdict(w, id, NF_DROP, true, cfg.mark_rejected);
-                return MNL_CB_OK;
-            }
+    if (cfg.block_datacenter && ctx.asn) {
+        uint32_t num = 0; std::string org;
+        if (ctx.asn->lookup(pi.af, pi.src_addr, num, org) &&
+            pol->is_blocked_asn(num, org)) {
+            st.bump(st.drop_asn);
+            log_decision(w, *pol, pi, country, "DROP-asn",
+                         "AS" + std::to_string(num) + " \"" + org + "\"");
+            send_verdict(w, id, NF_DROP, true, cfg.mark_rejected);
+            return MNL_CB_OK;
         }
     }
 
     // ---- Home, HTTPS/443 -> let it in; nginx enforces the UA ----------------
     if (is_https) {
-        g_stats.bump(g_stats.accept_https);
+        st.bump(st.accept_https);
         log_decision(w, *pol, pi, country, "ACCEPT-https(nginx-UA)");
         send_verdict(w, id, NF_ACCEPT, true, cfg.mark_approved);
         return MNL_CB_OK;
@@ -232,7 +243,7 @@ int queue_cb(const struct nlmsghdr* nlh, void* data) {
     // SYN / pure-ACK with no data: accept but stay UNDECIDED (ct mark 0) so the
     // request packet comes back for inspection.
     if (pi.l4_payload == nullptr || pi.l4_payload_len == 0) {
-        g_stats.bump(g_stats.needmore);
+        st.bump(st.needmore);
         send_verdict(w, id, NF_ACCEPT, false, 0);
         return MNL_CB_OK;
     }
@@ -244,7 +255,7 @@ int queue_cb(const struct nlmsghdr* nlh, void* data) {
         if (w.http_conns.size() >= cfg.max_http_conns) {
             sweep_http_conns(w, cfg.http_idle_timeout_s);
             if (w.http_conns.size() >= cfg.max_http_conns) {
-                g_stats.bump(g_stats.conns_shed);
+                st.bump(st.conns_shed);
                 send_verdict(w, id, NF_DROP, true, cfg.mark_rejected);
                 return MNL_CB_OK;
             }
@@ -252,39 +263,39 @@ int queue_cb(const struct nlmsghdr* nlh, void* data) {
         it = w.http_conns.emplace(key, ConnState{}).first;
         it->second.first_seen = std::chrono::steady_clock::now();
     }
-    ConnState& st = it->second;
-    if (st.buf.size() < cfg.max_inspect_bytes) {
-        size_t room = cfg.max_inspect_bytes - st.buf.size();
-        st.buf.append(reinterpret_cast<const char*>(pi.l4_payload),
+    ConnState& cs = it->second;
+    if (cs.buf.size() < cfg.max_inspect_bytes) {
+        size_t room = cfg.max_inspect_bytes - cs.buf.size();
+        cs.buf.append(reinterpret_cast<const char*>(pi.l4_payload),
                       std::min(room, pi.l4_payload_len));
     }
 
     std::string ua;
     DenyReason reason = DenyReason::None;
-    HttpVerdict hv = pol->evaluate_http(st.buf, ua, reason);
+    HttpVerdict hv = pol->evaluate_http(cs.buf, ua, reason);
     if (hv == HttpVerdict::NeedMore) {
-        g_stats.bump(g_stats.needmore);
+        st.bump(st.needmore);
         send_verdict(w, id, NF_ACCEPT, false, 0);
         return MNL_CB_OK;
     }
 
     w.http_conns.erase(it);
     if (hv == HttpVerdict::Allow) {
-        g_stats.bump(g_stats.accept_http);
+        st.bump(st.accept_http);
         log_decision(w, *pol, pi, country, "ACCEPT-http", "ua=\"" + ua + "\"");
         send_verdict(w, id, NF_ACCEPT, true, cfg.mark_approved);
     } else {
         const char* why = "bot";
         switch (reason) {
-            case DenyReason::MissingHeaders: g_stats.bump(g_stats.drop_headers); why = "missing-headers"; break;
-            case DenyReason::BotUa:          g_stats.bump(g_stats.drop_botua);   why = "bot-ua"; break;
-            case DenyReason::NotMobile:      g_stats.bump(g_stats.drop_ua);      why = "not-mobile"; break;
-            case DenyReason::NoUa:           g_stats.bump(g_stats.drop_ua);      why = "no-ua"; break;
-            case DenyReason::NoToken:        g_stats.bump(g_stats.drop_ua);      why = "no-token"; break;
-            case DenyReason::NotAllowlisted: g_stats.bump(g_stats.drop_ua);      why = "not-allowlisted"; break;
-            case DenyReason::TooLarge:       g_stats.bump(g_stats.drop_nothttp); why = "headers-too-large"; break;
-            case DenyReason::NotHttp:        g_stats.bump(g_stats.drop_nothttp); why = "not-http"; break;
-            default:                         g_stats.bump(g_stats.drop_nothttp); break;
+            case DenyReason::MissingHeaders: st.bump(st.drop_headers); why = "missing-headers"; break;
+            case DenyReason::BotUa:          st.bump(st.drop_botua);   why = "bot-ua"; break;
+            case DenyReason::NotMobile:      st.bump(st.drop_ua);      why = "not-mobile"; break;
+            case DenyReason::NoUa:           st.bump(st.drop_ua);      why = "no-ua"; break;
+            case DenyReason::NoToken:        st.bump(st.drop_ua);      why = "no-token"; break;
+            case DenyReason::NotAllowlisted: st.bump(st.drop_ua);      why = "not-allowlisted"; break;
+            case DenyReason::TooLarge:       st.bump(st.drop_nothttp); why = "headers-too-large"; break;
+            case DenyReason::NotHttp:        st.bump(st.drop_nothttp); why = "not-http"; break;
+            default:                         st.bump(st.drop_nothttp); break;
         }
         log_decision(w, *pol, pi, country, "DROP-http",
                      std::string(why) + (ua.empty() ? "" : " ua=\"" + ua + "\""));
@@ -293,7 +304,7 @@ int queue_cb(const struct nlmsghdr* nlh, void* data) {
     return MNL_CB_OK;
 }
 
-bool nfq_bind_queue(Worker& w) {
+bool nfq_bind_queue(Worker& w, uint32_t copy_range, uint32_t queue_maxlen) {
     char buf[MNL_SOCKET_BUFFER_SIZE];
     struct nlmsghdr* nlh;
 
@@ -302,29 +313,40 @@ bool nfq_bind_queue(Worker& w) {
     if (mnl_socket_sendto(w.nl, nlh, nlh->nlmsg_len) < 0) { perror("nfq bind"); return false; }
 
     nlh = nfq_nlmsg_put(buf, NFQNL_MSG_CONFIG, w.queue_num);
-    nfq_nlmsg_cfg_put_params(nlh, NFQNL_COPY_PACKET, 0xffff);
+    // Only copy the bytes we actually inspect (L3/L4 headers + up to the HTTP
+    // header window) instead of a full 64 KB per packet -- much less kernel->us
+    // memcpy per packet, which matters for large/GSO segments.
+    nfq_nlmsg_cfg_put_params(nlh, NFQNL_COPY_PACKET, copy_range);
+    // Let the kernel buffer more packets per queue before it drops under a burst.
+    mnl_attr_put_u32(nlh, NFQA_CFG_QUEUE_MAXLEN, htonl(queue_maxlen));
     mnl_attr_put_u32(nlh, NFQA_CFG_FLAGS, htonl(NFQA_CFG_F_CONNTRACK | NFQA_CFG_F_GSO));
     mnl_attr_put_u32(nlh, NFQA_CFG_MASK,  htonl(NFQA_CFG_F_CONNTRACK | NFQA_CFG_F_GSO));
     if (mnl_socket_sendto(w.nl, nlh, nlh->nlmsg_len) < 0) { perror("nfq params"); return false; }
     return true;
 }
 
-void worker_loop(uint16_t queue_num) {
+void worker_loop(uint16_t queue_num, Stats* st) {
     Worker w;
     w.queue_num = queue_num;
+    w.st = st;
     w.nl = mnl_socket_open(NETLINK_NETFILTER);
     if (!w.nl) { perror("mnl_socket_open"); g_stop = true; return; }
     if (mnl_socket_bind(w.nl, 0, MNL_SOCKET_AUTOPID) < 0) {
         perror("mnl_socket_bind"); g_stop = true; return;
     }
     w.portid = mnl_socket_get_portid(w.nl);
-    if (!nfq_bind_queue(w)) { g_stop = true; return; }
+
+    // Snapshot the kernel/buffer tunables once at startup (they aren't hot-reloaded).
+    Config boot = std::atomic_load(&g_policy)->cfg();
+    uint32_t copy_range = (uint32_t)std::min<size_t>(
+        0xffff, std::max<size_t>(1600, boot.max_inspect_bytes));
+    if (!nfq_bind_queue(w, copy_range, boot.queue_maxlen)) { g_stop = true; return; }
 
     int one = 1;
     mnl_socket_setsockopt(w.nl, NETLINK_NO_ENOBUFS, &one, sizeof(one));
     int fd = mnl_socket_get_fd(w.nl);
     // Grow socket buffers so bursts don't ENOBUFS immediately.
-    int rcvbuf = 8 * 1024 * 1024;
+    int rcvbuf = (int)boot.recv_buffer_bytes;
     setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
 
     const size_t rxsize = 0xffff + (MNL_SOCKET_BUFFER_SIZE / 2);
@@ -335,24 +357,33 @@ void worker_loop(uint16_t queue_num) {
         struct pollfd pfd { fd, POLLIN, 0 };
         int pr = poll(&pfd, 1, 500);
         if (pr < 0) { if (errno == EINTR) continue; perror("poll"); break; }
+
+        // Snapshot the hot-swappable state ONCE per wakeup. Holding these
+        // shared_ptrs keeps the objects alive for the whole batch, so the
+        // per-packet callback reads plain pointers and never hits the global
+        // lock that std::atomic_load(shared_ptr) takes on each call. A SIGHUP
+        // reload is picked up on the next wakeup -- with zero dropped flows.
+        auto geo = std::atomic_load(&g_geo);
+        auto pol = std::atomic_load(&g_policy);
+        auto asn = std::atomic_load(&g_asn);
+        int idle = pol->cfg().http_idle_timeout_s;
+
         if (pr == 0) {                       // idle tick: sweep stale flows
-            int idle = std::atomic_load(&g_policy)->cfg().http_idle_timeout_s;
             sweep_http_conns(w, idle);
             continue;
         }
         ssize_t n = mnl_socket_recvfrom(w.nl, rx.data(), rx.size());
         if (n == -1) {
-            if (errno == ENOBUFS) { g_stats.bump(g_stats.enobufs); continue; }
+            if (errno == ENOBUFS) { st->bump(st->enobufs); continue; }
             if (errno == EINTR || errno == EAGAIN) continue;
             perror("mnl_socket_recvfrom");
             break;
         }
-        if (mnl_cb_run(rx.data(), n, 0, w.portid, queue_cb, &w) < 0)
+        CbCtx ctx{ geo.get(), asn.get(), pol.get(), &w };
+        if (mnl_cb_run(rx.data(), n, 0, w.portid, queue_cb, &ctx) < 0)
             perror("mnl_cb_run");
-        if ((++pkt_counter & 0x3ff) == 0) {
-            int idle = std::atomic_load(&g_policy)->cfg().http_idle_timeout_s;
+        if ((++pkt_counter & 0x3ff) == 0)
             sweep_http_conns(w, idle);
-        }
     }
     mnl_socket_close(w.nl);
 }
@@ -408,9 +439,14 @@ int main(int argc, char** argv) {
     sigaddset(&set, SIGPIPE);
     pthread_sigmask(SIG_BLOCK, &set, nullptr);
 
+    // One private, cache-line-aligned Stats block per worker (no cross-core
+    // sharing on the counter hot path). Sized once and never reallocated, so the
+    // &stats[i] handed to each worker stays stable.
+    std::vector<Stats> stats(cfg.num_queues);
+
     std::vector<std::thread> workers;
     for (unsigned i = 0; i < cfg.num_queues; ++i)
-        workers.emplace_back(worker_loop, (uint16_t)(cfg.base_queue + i));
+        workers.emplace_back(worker_loop, (uint16_t)(cfg.base_queue + i), &stats[i]);
 
     std::cerr << "webup-firewall: queues " << cfg.base_queue << ".."
               << (cfg.base_queue + cfg.num_queues - 1)
@@ -436,7 +472,7 @@ int main(int argc, char** argv) {
             std::cerr << "webup-firewall: reloading\n";
             load_state(cfg_path, /*initial=*/false);
         } else if (s == SIGUSR1) {
-            std::cerr << g_stats.format() << "\n";
+            std::cerr << Stats::format(stats) << "\n";
         } // else: timeout (EAGAIN) or SIGPIPE -> fall through
 
 #ifdef HAVE_SYSTEMD
@@ -445,7 +481,7 @@ int main(int argc, char** argv) {
         time_t now = time(nullptr);
         Config cur = std::atomic_load(&g_policy)->cfg();
         if (cur.stats_interval_s > 0 && now - last_stats >= cur.stats_interval_s) {
-            std::cerr << g_stats.format() << "\n";
+            std::cerr << Stats::format(stats) << "\n";
             last_stats = now;
         }
     }
@@ -454,6 +490,6 @@ int main(int argc, char** argv) {
     sd_notify(0, "STOPPING=1");
 #endif
     for (auto& t : workers) if (t.joinable()) t.join();
-    std::cerr << g_stats.format() << "\n";
+    std::cerr << Stats::format(stats) << "\n";
     return 0;
 }

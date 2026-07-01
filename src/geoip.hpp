@@ -11,10 +11,15 @@ public:
     GeoIP(const GeoIP&) = delete;
     GeoIP& operator=(const GeoIP&) = delete;
 
-    // Returns the ISO 3166-1 alpha-2 country code (e.g. "IN", "US") for a
-    // textual IPv4/IPv6 address, or "" if the address is unknown / private /
-    // not in the database.
-    std::string country(const std::string& ip_text) const;
+    // Returns the ISO 3166-1 alpha-2 country code (e.g. "IN", "US") for a raw
+    // address (af = AF_INET with 4 bytes, or AF_INET6 with 16 bytes), or "" if
+    // the address is unknown / private / not in the database.
+    //
+    // Takes the binary address directly (not text): this looks up via
+    // MMDB_lookup_sockaddr() and avoids the getaddrinfo() call that
+    // MMDB_lookup_string() makes on every single lookup -- a major saving on the
+    // per-packet hot path.
+    std::string country(int af, const void* addr) const;
 
 private:
     // mutable so country() can stay const even if the linked libmaxminddb

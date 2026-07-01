@@ -8,11 +8,24 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 # Position-independent executables (ASLR) + warnings + hardening.
+# Optimization level comes from CMAKE_BUILD_TYPE (Release => -O3 -DNDEBUG); we
+# don't pin -O2 here so the hot packet path gets the full Release treatment.
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
-add_compile_options(-Wall -Wextra -O2
+add_compile_options(-Wall -Wextra
   -fstack-protector-strong
   $<$<CONFIG:Release>:-D_FORTIFY_SOURCE=2>)
 add_link_options(-pie -Wl,-z,relro,-z,now -Wl,-z,noexecstack)
+
+# Link-time optimization (Release): lets the geo/asn/policy/packet hot path
+# inline across translation units. Enabled only where the toolchain supports it.
+include(CheckIPOSupported)
+check_ipo_supported(RESULT HAS_IPO OUTPUT IPO_MSG)
+if(HAS_IPO AND CMAKE_BUILD_TYPE STREQUAL "Release")
+  set(CMAKE_INTERPROCEDURAL_OPTIMIZATION ON)
+  message(STATUS "LTO / interprocedural optimization: enabled")
+else()
+  message(STATUS "LTO / interprocedural optimization: disabled (${IPO_MSG})")
+endif()
 
 # -fstack-clash-protection is supported by recent gcc/clang on common arches.
 include(CheckCXXCompilerFlag)
